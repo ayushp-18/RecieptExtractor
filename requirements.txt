@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+google-genai
+google-generativeai
+requests
+pydantic
