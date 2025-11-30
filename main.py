@@ -13,6 +13,7 @@ TESSERACT_EXE = r"D:\orc\tesseract.exe"
 if os.path.exists(TESSERACT_EXE):
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
 
+
 # ==========================
 # HELPERS
 # ==========================
@@ -97,6 +98,7 @@ JUNK_PATTERNS = [
     "tem quantity",
 ]
 
+
 def is_junk_page(txt):
     low = txt.lower()
     return any(p in low for p in JUNK_PATTERNS)
@@ -113,7 +115,6 @@ def normalize_name(s):
 # ==========================
 app = FastAPI(title="Bill OCR Extractor API")
 
-
 class ExtractRequest(BaseModel):
     document: str   # URL or local path
 
@@ -122,29 +123,31 @@ class ExtractRequest(BaseModel):
 async def extract_bill_data(req: ExtractRequest):
     doc = req.document.strip()
 
-    # Case 1: URL download
-    if doc.startswith("http://") or doc.startswith("https://"):
-        try:
-            r = requests.get(doc)
-            r.raise_for_status()
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to download PDF URL: {e}")
+# Case 1: URL download
+if doc.startswith("http://") or doc.startswith("https://"):
+    import requests, tempfile
+    try:
+        r = requests.get(doc)
+        r.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download PDF URL: {e}")
 
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        tmp.write(r.content)
-        tmp.close()
-        pdf_path = tmp.name
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.write(r.content)
+    tmp.close()
+    pdf_path = tmp.name
 
-    # Case 2: Local file
-    elif os.path.exists(doc):
-        pdf_path = doc
+# Case 2: Local file
+elif os.path.exists(doc):
+    pdf_path = doc
 
-    # Invalid input
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid document path. Provide a URL or a valid local file path."
-        )
+# Invalid input
+else:
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid document path. Provide a URL or a valid local file path."
+    )
+
 
     # Convert PDF
     try:
