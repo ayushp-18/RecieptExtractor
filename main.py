@@ -1,36 +1,39 @@
+# main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import os, re, tempfile, requests
+import os
+import re
+import tempfile
+import requests
 from pdf2image import convert_from_path
 import pytesseract
+from typing import Optional
+from PIL import Image
 
 # ==========================
-# CONFIG
+# CONFIG (use env vars in deployment)
 # ==========================
-POPPLER_BIN = r"D:\invoice-extractor\poppler\poppler-25.11.0\Library\bin"
-TESSERACT_EXE = r"D:\orc\tesseract.exe"
+POPPLER_BIN = os.environ.get("POPPLER_BIN")  # e.g. "/usr/bin" or "/usr/local/bin"
+TESSERACT_CMD = os.environ.get("TESSERACT_CMD")  # e.g. "/usr/bin/tesseract"
 
-if os.path.exists(TESSERACT_EXE):
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
-
+if TESSERACT_CMD and os.path.exists(TESSERACT_CMD):
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 # ==========================
 # HELPERS
 # ==========================
-def download_pdf(url: str) -> str:
-    """Downloads a PDF from a URL and returns the local file path."""
+def download_file(url: str, suffix: str = "") -> str:
+    """Downloads a file from a URL and returns the local file path."""
     try:
-        response = requests.get(url, timeout=20)
-        if response.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"Failed to download PDF: HTTP {response.status_code}")
-
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        temp_file.write(response.content)
-        temp_file.close()
-        return temp_file.name
-
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"PDF download failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to download URL: {e}")
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(r.content)
+    tmp.close()
+    return tmp.name
 
 
 def clean_num(s):
@@ -115,6 +118,7 @@ def normalize_name(s):
 # ==========================
 app = FastAPI(title="Bill OCR Extractor API")
 
+
 class ExtractRequest(BaseModel):
     document: str   # URL or local path
 
@@ -123,69 +127,118 @@ class ExtractRequest(BaseModel):
 async def extract_bill_data(req: ExtractRequest):
     doc = req.document.strip()
 
-# Case 1: URL download
-if doc.startswith("http://") or doc.startswith("https://"):
-    import requests, tempfile
-    try:
-        r = requests.get(doc)
-        r.raise_for_status()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download PDF URL: {e}")
+    # Determine whether doc is a URL or local path
+    if doc.startswith("http://") or doc.startswith("https://"):
+        # download
+        try:
+            # try to guess suffix
+            lower = doc.lower()
+            if lower.endswith(".pdf"):
+                pdf_path = download_file(doc, suffix=".pdf")
+                is_pdf = True
+            elif any(lower.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".tiff", ".bmp"]):
+                pdf_path = download_file(doc, suffix=os.path.splitext(doc)[1])
+                is_pdf = False
+            else:
+                # download as bytes and try to inspect simple magic
+                tmp_path = download_file(doc)
+                ext = os.path.splitext(doc)[1].lower()
+                if ext == ".pdf":
+                    pdf_path = tmp_path
+                    is_pdf = True
+                else:
+                    # fallback assume pdf
+                    pdf_path = tmp_path
+                    is_pdf = True
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download document: {e}")
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    tmp.write(r.content)
-    tmp.close()
-    pdf_path = tmp.name
-
-# Case 2: Local file
-elif os.path.exists(doc):
-    pdf_path = doc
-
-# Invalid input
-else:
-    raise HTTPException(
-        status_code=400,
-        detail="Invalid document path. Provide a URL or a valid local file path."
-    )
-
-
-    # Convert PDF
-    try:
-        pages = convert_from_path(pdf_path, dpi=300, poppler_path=POPPLER_BIN)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF conversion failed: {e}")
+    elif os.path.exists(doc):
+        # local file path
+        ext = os.path.splitext(doc)[1].lower()
+        is_pdf = ext == ".pdf"
+        pdf_path = doc
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document path. Provide a URL or a valid local file path."
+        )
 
     pagewise = []
     collected = []
 
-    for i, page in enumerate(pages, 1):
-        txt = pytesseract.image_to_string(page)
+    # If the input is an image file: handle directly with PIL -> pytesseract
+    try:
+        if not is_pdf and os.path.exists(pdf_path):
+            with Image.open(pdf_path) as im:
+                txt = pytesseract.image_to_string(im)
+                if not is_junk_page(txt):
+                    items = parse_page_text(txt)
+                    for it in items:
+                        it["_page_no"] = "1"
+                        collected.append(it)
+                    pagewise.append({
+                        "page_no": "1",
+                        "page_type": "Bill Detail",
+                        "bill_items": items
+                    })
+        else:
+            # PDF handling: requires poppler (pdftoppm). Use POPPLER_BIN if provided.
+            poppler_arg = POPPLER_BIN if POPPLER_BIN else None
+            try:
+                pages = convert_from_path(pdf_path, dpi=300, poppler_path=poppler_arg) if poppler_arg else convert_from_path(pdf_path, dpi=300)
+            except Exception as e:
+                # helpful message for deployments without poppler
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "PDF conversion failed. Library `pdf2image` requires the Poppler `pdftoppm` binary.\n"
+                        "In deployment, install poppler and set the POPPLER_BIN environment variable to its bin directory, "
+                        "e.g. `/usr/bin` or `/usr/local/bin`. Error: " + str(e)
+                    )
+                )
 
-        if is_junk_page(txt):
-            continue
+            for i, page in enumerate(pages, 1):
+                txt = pytesseract.image_to_string(page)
+                if is_junk_page(txt):
+                    continue
 
-        items = parse_page_text(txt)
+                items = parse_page_text(txt)
+                for it in items:
+                    it["_page_no"] = str(i)
+                    collected.append(it)
 
-        for it in items:
-            it["_page_no"] = str(i)
-            collected.append(it)
+                pagewise.append({
+                    "page_no": str(i),
+                    "page_type": "Bill Detail",
+                    "bill_items": items
+                })
 
-        pagewise.append({
-            "page_no": str(i),
-            "page_type": "Bill Detail",
-            "bill_items": items
-        })
+    finally:
+        # If we downloaded a temporary file (not user-supplied local path), try to remove it
+        # Only remove if it's in the system temp directory
+        try:
+            tmpdir = tempfile.gettempdir()
+            if pdf_path and os.path.exists(pdf_path) and pdf_path.startswith(tmpdir):
+                try:
+                    os.remove(pdf_path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # Dedupe
     seen = set()
     final_items = []
     for it in collected:
-        key = (normalize_name(it["item_name"]), it.get("item_amount"))
+        key = (normalize_name(it.get("item_name", "")), it.get("item_amount"))
         if key not in seen:
             seen.add(key)
             final_items.append(it)
 
-    total_amt = round(sum((it["item_amount"] or 0) for it in final_items), 2)
+    total_amt = round(sum((it.get("item_amount") or 0) for it in final_items), 2)
 
     return {
         "is_success": True,
